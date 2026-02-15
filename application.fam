@@ -1,0 +1,20 @@
+# For details & more options, see documentation/AppManifests.md in firmware repo
+
+App(
+    appid="bigclock",                 # Must be unique
+    name="Big Clock",                 # Displayed in menus
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="bigclock_app",
+    stack_size=2 * 1024,
+    fap_category="Tools",
+
+    # Optional values (but useful)
+    fap_version="0.1.0",
+    fap_icon="images/bigclock.png",   # 10x10 1-bit PNG
+    fap_description="Fullscreen 12-hour clock; keeps backlight on while running.",
+    fap_author="Tad Harrison",
+    fap_weburl="https://github.com/harrist4/flipper-bigclock",
+
+    # Image assets to compile for this application
+    fap_icon_assets="images",
+)

@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# uFBT build outputs
+dist/
+.ufbt/
+.ufbt-cache/
+build/
+
+# editors
+.vscode/
+.idea/
+
