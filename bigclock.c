@@ -10,6 +10,8 @@
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 
+#include <storage/storage.h>
+
 // ----------------------------------------------------------------------------
 // App state
 // ----------------------------------------------------------------------------
@@ -25,7 +27,50 @@ typedef struct {
     ViewPort* vp;             // fullscreen drawing + input hook
     FuriTimer* timer;         // periodic "tick" that requests a redraw
     NotificationApp* notif;   // backlight control (keep screen on during app)
+    bool mode_24h;            // false=12h with AM/PM, true=24h with "24"
 } App;
+
+#define MODE_FILE APP_DATA_PATH("mode24.bin")
+
+static bool load_mode_24h(void) {
+    bool mode = false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(storage);
+
+    FuriString* path = furi_string_alloc_set(MODE_FILE);
+    storage_common_resolve_path_and_ensure_app_directory(storage, path);
+
+    if(storage_file_open(f, furi_string_get_cstr(path), FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint8_t b = 0;
+        if(storage_file_read(f, &b, 1) == 1) mode = (b != 0);
+        storage_file_close(f);
+    }
+
+    furi_string_free(path);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+
+    return mode;
+}
+
+static void save_mode_24h(bool mode) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(storage);
+
+    FuriString* path = furi_string_alloc_set(MODE_FILE);
+    storage_common_resolve_path_and_ensure_app_directory(storage, path);
+
+    if(storage_file_open(f, furi_string_get_cstr(path), FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        uint8_t b = mode ? 1 : 0;
+        storage_file_write(f, &b, 1);
+        storage_file_close(f);
+    }
+
+    furi_string_free(path);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
 
 // ----------------------------------------------------------------------------
 // 7-seg digit drawing helpers
@@ -90,7 +135,7 @@ static void draw_colon(Canvas* c, int x, int y, int t) {
 // We do not store time in app state. We read RTC each draw and render from scratch.
 //
 static void draw_cb(Canvas* canvas, void* ctx) {
-    UNUSED(ctx);
+    App* app = ctx;
 
     DateTime dt;
     furi_hal_rtc_get_datetime(&dt);
@@ -98,22 +143,29 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     const int H24 = (int)dt.hour;
     const int M   = (int)dt.minute;
 
-    // 12-hour clock: 0 -> 12, 13 -> 1, etc.
-    int H12 = H24 % 12;
-    if(H12 == 0) H12 = 12;
+    int H = H24; // display hour
+    bool show_24 = app && app->mode_24h;
 
-    // Hours tens digit is blank for 1..9, then 1 for 10..12.
-    const int ht_raw = H12 / 10;               // 0..1
-    const int ht = (ht_raw == 0) ? -1 : ht_raw;
-    const int ho = H12 % 10;
+    if(!show_24) {
+        // 12-hour clock: 0 -> 12, 13 -> 1, etc.
+        H = H24 % 12;
+        if(H == 0) H = 12;
+    }
+
+    // Hours tens digit is blank for 1..9 in 12h mode; in 24h mode show 0 for 00..09.
+    int ht_raw = H / 10;
+    int ht = ht_raw;
+    if(!show_24 && ht_raw == 0) ht = -1;
+
+    const int ho = H % 10;
 
     const int mt = M / 10;
     const int mo = M % 10;
 
     // Layout constants tuned for 128x64.
     // Right side reserves a narrow gutter for a small "alive" indicator.
-    const int y = 2;
-    const int h = 60;
+    const int y = 0;
+    const int h = 64;
     const int t = 7;
 
     const int bar_area_w = 12;
@@ -151,12 +203,12 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(count > steps) count = steps;
 
     // Make the column shorter to leave room for AM/PM at the bottom.
-    const int bar_w = 6;
-    const int bar_h = 8;
+    const int bar_w = 11;
+    const int bar_h = 7;
     const int bar_gap = 1;
 
-    const int bx = right_edge + ((bar_area_w - bar_w) / 2);
-    const int by = 2;
+    const int bx = right_edge + ((bar_area_w - bar_w + 1) / 2) ;
+    const int by = 0;
 
     for(int i = 0; i < count; i++) {
         int yy = by + i * (bar_h + bar_gap);
@@ -165,16 +217,19 @@ static void draw_cb(Canvas* canvas, void* ctx) {
 
     // AM/PM indicator (LCD-style): two fixed labels, only one is "lit".
     // They must not occupy the same location.
-    const bool is_pm = (((int)dt.hour) >= 12);
+    const bool is_pm = (H24 >= 12);
     const bool is_am = !is_pm;
 
-    const int col_h = (steps * bar_h) + ((steps - 1) * bar_gap);
     const int ap_x = right_edge + 1;
-    const int ap_y0 = by + col_h + 2;
+    const int ap_y0 = 48;
 
     canvas_set_font(canvas, FontKeyboard);
-    if(is_am) canvas_draw_str(canvas, ap_x, ap_y0 + 7, "AM");
-    if(is_pm) canvas_draw_str(canvas, ap_x, ap_y0 + 15, "PM");
+    if(show_24) {
+        canvas_draw_str(canvas, ap_x, ap_y0, "24");
+    } else {
+        if(is_am) canvas_draw_str(canvas, ap_x, ap_y0 + 8, "AM");
+        if(is_pm) canvas_draw_str(canvas, ap_x, ap_y0 + 16, "PM");
+    }
     canvas_set_font(canvas, FontPrimary);
 }
 
@@ -212,13 +267,14 @@ int32_t bigclock_app(void* p) {
     UNUSED(p);
 
     App app = {0};
+    app.mode_24h = load_mode_24h();
 
     // Input events sent from ViewPort callback to this thread.
     app.q = furi_message_queue_alloc(8, sizeof(InputEvent));
 
     // Create fullscreen ViewPort and attach draw + input callbacks.
     app.vp = view_port_alloc();
-    view_port_draw_callback_set(app.vp, draw_cb, NULL);
+    view_port_draw_callback_set(app.vp, draw_cb, &app);
     view_port_input_callback_set(app.vp, input_cb, &app);
 
     // Register the ViewPort with the system GUI.
@@ -244,8 +300,12 @@ int32_t bigclock_app(void* p) {
         if(event.type == InputTypeShort && event.key == InputKeyBack) {
             break;
         }
-
-        // Baseline: ignore all other inputs.
+        // Toggle 12/24 hour on OK
+        if(event.type == InputTypeShort && event.key == InputKeyOk) {
+            app.mode_24h = !app.mode_24h;
+            save_mode_24h(app.mode_24h);
+            view_port_update(app.vp);
+        }
     }
 
     // Stop periodic redraws.
