@@ -30,8 +30,42 @@ typedef struct {
     bool mode_24h;            // false=12h with AM/PM, true=24h with "24"
 } App;
 
+// ----------------------------------------------------------------------------
+// Persisted settings: 24-hour mode
+// ----------------------------------------------------------------------------
+//
+// We keep one byte of state ("mode_24h") across launches.
+// Flipper apps are expected to store small bits of configuration in the app data
+// directory on the SD card, addressed via APP_DATA_PATH(...).
+//
+// We do NOT hand-manage file paths or directories here. Instead we rely on
+// storage_common_resolve_path_and_ensure_app_directory(), which:
+//   - resolves the APP_DATA_PATH alias into a real filesystem path, and
+//   - creates the app's data directory if it doesn't already exist.
+//
+// File format:
+//   MODE_FILE contains a single byte:
+//     0 = 12-hour display
+//     1 = 24-hour display
+//
+// Failure behavior:
+//   - If the file doesn't exist or can't be read, we default to 12-hour mode.
+//   - Writes are best-effort; if they fail, the app still runs normally.
+//
+
 #define MODE_FILE APP_DATA_PATH("mode24.bin")
 
+// Load persisted 24-hour mode setting from MODE_FILE.
+//
+// Returns:
+//   true  => 24-hour mode enabled
+//   false => 12-hour mode (default)
+//
+// Notes:
+//   - Missing file is not an error; we treat it as "default settings".
+//   - Uses the Storage service (RECORD_STORAGE) and a temporary File handle.
+//   - Path resolution + directory creation is handled by the storage helper.
+//
 static bool load_mode_24h(void) {
     bool mode = false;
 
@@ -54,6 +88,18 @@ static bool load_mode_24h(void) {
     return mode;
 }
 
+// Save persisted 24-hour mode setting to MODE_FILE.
+//
+// Writes a single byte:
+//   0 = 12-hour mode
+//   1 = 24-hour mode
+//
+// Notes:
+//   - Called when the user toggles mode (OK short press).
+//   - Uses FSOM_CREATE_ALWAYS to overwrite atomically-at-our-scale.
+//   - Best-effort: if the SD card isn't present or the write fails, we simply
+//     won't remember the setting next launch.
+//
 static void save_mode_24h(bool mode) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(storage);
@@ -101,6 +147,106 @@ static const uint8_t segmap[10] = {
     /*9*/ 0b1101111,
 };
 
+typedef enum {
+    SegmentStyleClassic = 0,
+    SegmentStylePinched = 1,
+} SegmentStyle;
+
+// Single dial for segment appearance.
+// SegmentStyleClassic keeps the original look.
+// SegmentStylePinched enables the center-pinch style.
+static const SegmentStyle kSegmentStyle = SegmentStylePinched;
+
+// Draw a horizontal segment with a subtle center "pinch":
+// full-thickness shoulders and a slightly thinner middle section.
+static void draw_hseg_pinched(Canvas* c, int x, int y, int w, int t) {
+    if(w <= 0 || t <= 0) return;
+
+    const int pinch = (t >= 4) ? ((t >= 8) ? 2 : 1) : 0;
+    const int mid_h = t - (pinch * 2);
+    if(mid_h <= 0 || w < 5) {
+        canvas_draw_box(c, x, y, w, t);
+        return;
+    }
+
+    int shoulder = w / 4;
+    if(shoulder < 2) shoulder = 2;
+    if(shoulder > 6) shoulder = 6;
+    if(shoulder * 2 >= w) {
+        canvas_draw_box(c, x, y, w, t);
+        return;
+    }
+
+    const int mid_w = w - (shoulder * 2);
+    canvas_draw_box(c, x, y, shoulder, t);
+    canvas_draw_box(c, x + shoulder, y + pinch, mid_w, mid_h);
+    canvas_draw_box(c, x + shoulder + mid_w, y, shoulder, t);
+}
+
+// Draw a vertical segment with a subtle center "pinch":
+// full-width caps and a slightly thinner middle section.
+static void draw_vseg_pinched(Canvas* c, int x, int y, int t, int h) {
+    if(h <= 0 || t <= 0) return;
+
+    const int pinch = (t >= 4) ? ((t >= 8) ? 2 : 1) : 0;
+    const int mid_w = t - (pinch * 2);
+    if(mid_w <= 0 || h < 5) {
+        canvas_draw_box(c, x, y, t, h);
+        return;
+    }
+
+    int cap = h / 4;
+    if(cap < 2) cap = 2;
+    if(cap > 6) cap = 6;
+    if(cap * 2 >= h) {
+        canvas_draw_box(c, x, y, t, h);
+        return;
+    }
+
+    const int mid_h = h - (cap * 2);
+    canvas_draw_box(c, x, y, t, cap);
+    canvas_draw_box(c, x + pinch, y + cap, mid_w, mid_h);
+    canvas_draw_box(c, x, y + cap + mid_h, t, cap);
+}
+
+// ----------------------------------------------------------------------------
+// segdigit()
+// ----------------------------------------------------------------------------
+//
+// Draw one large 7-segment-style digit using filled rectangles.
+//
+// This is a deliberately "brute force" renderer: it does no caching and it
+// does not attempt to be a general font system. It simply takes a digit value
+// (0-9) and draws the corresponding segments into a fixed bounding box.
+//
+// Parameters:
+//   c  - Canvas to draw into.
+//   x,y- Top-left corner of the digit bounding box.
+//   w  - Total digit width in pixels (including segment thickness).
+//   h  - Total digit height in pixels.
+//   t  - Segment thickness in pixels.
+//   d  - Digit to draw:
+//          0..9 draws that digit
+//          -1 means "blank" (used for suppressing a leading 0 in 12h mode)
+//
+// Segment layout (classic 7-seg):
+//
+//        a
+//     +-----+
+//   f |     | b
+//     |- g -|
+//   e |     | c
+//     +-----+
+//        d
+//
+// Implementation notes:
+//   - segmap[] holds the segment enable bitmask for each digit.
+//   - Horizontal segments (a,g,d) are drawn full-width so overlaps look solid.
+//   - Vertical segments (b,c,e,f) each span half height, meeting the middle bar.
+//   - The middle segment 'g' is centered at y + h/2 with a half-thickness offset.
+//   - This expects sane values (t <= w and t <= h/2). If you make t huge,
+//     you'll get interesting... abstract art.
+//
 static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d) {
     // d is -1 to mean "blank" (used for leading zero in hours).
     if(d < 0 || d > 9) return;
@@ -109,18 +255,47 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d) {
     int ym = y + (h / 2);
     int half = h / 2;
 
-    // Horizontal segments. Full width so overlaps look solid (especially digit 8).
-    if(m & (1 << 0)) canvas_draw_box(c, x, y, w, t);               // a
-    if(m & (1 << 6)) canvas_draw_box(c, x, ym - (t / 2), w, t);    // g
-    if(m & (1 << 3)) canvas_draw_box(c, x, y + h - t, w, t);       // d
+    if(kSegmentStyle == SegmentStylePinched) {
+        // Horizontal segments with a narrower center section.
+        if(m & (1 << 0)) draw_hseg_pinched(c, x, y, w, t);            // a
+        if(m & (1 << 6)) draw_hseg_pinched(c, x, ym - (t / 2), w, t); // g
+        if(m & (1 << 3)) draw_hseg_pinched(c, x, y + h - t, w, t);    // d
 
-    // Vertical segments. Each spans half height so they meet the middle bar cleanly.
-    if(m & (1 << 5)) canvas_draw_box(c, x, y, t, half);                       // f
-    if(m & (1 << 1)) canvas_draw_box(c, x + w - t, y, t, half);               // b
-    if(m & (1 << 4)) canvas_draw_box(c, x, y + h - half, t, half);            // e
-    if(m & (1 << 2)) canvas_draw_box(c, x + w - t, y + h - half, t, half);    // c
+        // Vertical segments with a narrower center section.
+        if(m & (1 << 5)) draw_vseg_pinched(c, x, y, t, half);                    // f
+        if(m & (1 << 1)) draw_vseg_pinched(c, x + w - t, y, t, half);            // b
+        if(m & (1 << 4)) draw_vseg_pinched(c, x, y + h - half, t, half);         // e
+        if(m & (1 << 2)) draw_vseg_pinched(c, x + w - t, y + h - half, t, half); // c
+    } else {
+        // Original look: plain full-thickness rectangles.
+        if(m & (1 << 0)) canvas_draw_box(c, x, y, w, t);            // a
+        if(m & (1 << 6)) canvas_draw_box(c, x, ym - (t / 2), w, t); // g
+        if(m & (1 << 3)) canvas_draw_box(c, x, y + h - t, w, t);    // d
+
+        if(m & (1 << 5)) canvas_draw_box(c, x, y, t, half);                    // f
+        if(m & (1 << 1)) canvas_draw_box(c, x + w - t, y, t, half);            // b
+        if(m & (1 << 4)) canvas_draw_box(c, x, y + h - half, t, half);         // e
+        if(m & (1 << 2)) canvas_draw_box(c, x + w - t, y + h - half, t, half); // c
+    }
 }
 
+// ----------------------------------------------------------------------------
+// draw_colon()
+// ----------------------------------------------------------------------------
+//
+// Draw the ":" between HH and MM as two filled square dots.
+//
+// Parameters:
+//   c  - Canvas to draw into.
+//   x,y- Origin; we treat y as the top of the digit area.
+//   t  - Dot size in pixels (we reuse the "segment thickness" so it matches
+//        the visual weight of the 7-seg digits).
+//
+// Notes:
+//   - The Y offsets (currently +16 and +40) are tuned for the 64px-tall layout.
+//     If you change digit height or vertical positioning, these may need retuning.
+//   - This is intentionally dumb and fast: no blink, no animation, just pixels.
+//
 static void draw_colon(Canvas* c, int x, int y, int t) {
     // Two square dots between HH and MM.
     canvas_draw_box(c, x, y + 16, t, t);
@@ -322,8 +497,6 @@ int32_t bigclock_app(void* p) {
 
     // Restore normal backlight behavior and clear any display overrides.
     notification_message(app.notif, &sequence_display_backlight_enforce_auto);
-    notification_message(app.notif, &sequence_reset_display);
     furi_record_close(RECORD_NOTIFICATION);
-
     return 0;
 }
