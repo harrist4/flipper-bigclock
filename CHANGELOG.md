@@ -6,6 +6,9 @@
 
 ## 2026-03-01
 - Added pinched 7-segment rendering option (feature available in code, style-selectable)
+- Added lozenge 7-segment style with tapered ends and centerline-aligned segment geometry
+- Added long-OK segment style cycling (Classic -> Pinched -> Lozenge)
+- Persisted segment style across launches (`segment_style.bin`)
 - Updated brightness HUD: removed +/- glyphs and expanded meter to full right-side height
 - Improved backlight exit behavior and state restore flow
 - Dimming/brightness control is still in-progress and needs another focused pass later

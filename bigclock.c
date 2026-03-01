@@ -28,6 +28,7 @@ typedef struct {
     FuriTimer* timer;         // periodic "tick" that requests a redraw
     NotificationApp* notif;   // backlight control (keep screen on during app)
     bool mode_24h;            // false=12h with AM/PM, true=24h with "24"
+    uint8_t segment_style;    // SegmentStyle persisted selection
 } App;
 
 // ----------------------------------------------------------------------------
@@ -54,6 +55,7 @@ typedef struct {
 //
 
 #define MODE_FILE APP_DATA_PATH("mode24.bin")
+#define SEGMENT_STYLE_FILE APP_DATA_PATH("segment_style.bin")
 
 // Load persisted 24-hour mode setting from MODE_FILE.
 //
@@ -118,6 +120,47 @@ static void save_mode_24h(bool mode) {
     furi_record_close(RECORD_STORAGE);
 }
 
+// Load persisted segment style; defaults to lozenge.
+static uint8_t load_segment_style(void) {
+    uint8_t style = 2; // SegmentStyleLozenge
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(storage);
+
+    FuriString* path = furi_string_alloc_set(SEGMENT_STYLE_FILE);
+    storage_common_resolve_path_and_ensure_app_directory(storage, path);
+
+    if(storage_file_open(f, furi_string_get_cstr(path), FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint8_t b = 0;
+        if(storage_file_read(f, &b, 1) == 1 && b <= 2) style = b;
+        storage_file_close(f);
+    }
+
+    furi_string_free(path);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+
+    return style;
+}
+
+// Save persisted segment style.
+static void save_segment_style(uint8_t style) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(storage);
+
+    FuriString* path = furi_string_alloc_set(SEGMENT_STYLE_FILE);
+    storage_common_resolve_path_and_ensure_app_directory(storage, path);
+
+    if(storage_file_open(f, furi_string_get_cstr(path), FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_write(f, &style, 1);
+        storage_file_close(f);
+    }
+
+    furi_string_free(path);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
 // ----------------------------------------------------------------------------
 // 7-seg digit drawing helpers
 // ----------------------------------------------------------------------------
@@ -150,12 +193,8 @@ static const uint8_t segmap[10] = {
 typedef enum {
     SegmentStyleClassic = 0,
     SegmentStylePinched = 1,
+    SegmentStyleLozenge = 2,
 } SegmentStyle;
-
-// Single dial for segment appearance.
-// SegmentStyleClassic keeps the original look.
-// SegmentStylePinched enables the center-pinch style.
-static const SegmentStyle kSegmentStyle = SegmentStylePinched;
 
 // Draw a horizontal segment with a subtle center "pinch":
 // full-thickness shoulders and a slightly thinner middle section.
@@ -209,6 +248,52 @@ static void draw_vseg_pinched(Canvas* c, int x, int y, int t, int h) {
     canvas_draw_box(c, x, y + cap + mid_h, t, cap);
 }
 
+// Draw a horizontal lozenge segment: center rectangle with tapered end caps.
+static void draw_hseg_lozenge(Canvas* c, int x, int y, int w, int t) {
+    if(w <= 0 || t <= 0) return;
+    int tip = (t / 2) + 1;
+    if((tip * 2) >= w) {
+        canvas_draw_box(c, x, y, w, t);
+        return;
+    }
+
+    canvas_draw_box(c, x + tip, y, w - (tip * 2), t);
+
+    const int den = (t + 1) / 2;
+    for(int dy = 0; dy < t; dy++) {
+        int k = dy;
+        if(k > (t - 1 - dy)) k = (t - 1 - dy);
+        int reach = (tip * (k + 1)) / den;
+        if(reach < 1) reach = 1;
+
+        canvas_draw_line(c, x + tip - reach, y + dy, x + tip - 1, y + dy);
+        canvas_draw_line(c, x + w - tip, y + dy, x + w - tip + reach - 1, y + dy);
+    }
+}
+
+// Draw a vertical lozenge segment: center rectangle with tapered end caps.
+static void draw_vseg_lozenge(Canvas* c, int x, int y, int t, int h) {
+    if(h <= 0 || t <= 0) return;
+    int tip = (t / 2) + 1;
+    if((tip * 2) >= h) {
+        canvas_draw_box(c, x, y, t, h);
+        return;
+    }
+
+    canvas_draw_box(c, x, y + tip, t, h - (tip * 2));
+
+    const int den = (t + 1) / 2;
+    for(int dx = 0; dx < t; dx++) {
+        int k = dx;
+        if(k > (t - 1 - dx)) k = (t - 1 - dx);
+        int reach = (tip * (k + 1)) / den;
+        if(reach < 1) reach = 1;
+
+        canvas_draw_line(c, x + dx, y + tip - reach, x + dx, y + tip - 1);
+        canvas_draw_line(c, x + dx, y + h - tip, x + dx, y + h - tip + reach - 1);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // segdigit()
 // ----------------------------------------------------------------------------
@@ -247,7 +332,7 @@ static void draw_vseg_pinched(Canvas* c, int x, int y, int t, int h) {
 //   - This expects sane values (t <= w and t <= h/2). If you make t huge,
 //     you'll get interesting... abstract art.
 //
-static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d) {
+static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, SegmentStyle style) {
     // d is -1 to mean "blank" (used for leading zero in hours).
     if(d < 0 || d > 9) return;
 
@@ -255,7 +340,7 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d) {
     int ym = y + (h / 2);
     int half = h / 2;
 
-    if(kSegmentStyle == SegmentStylePinched) {
+    if(style == SegmentStylePinched) {
         // Horizontal segments with a narrower center section.
         if(m & (1 << 0)) draw_hseg_pinched(c, x, y, w, t);            // a
         if(m & (1 << 6)) draw_hseg_pinched(c, x, ym - (t / 2), w, t); // g
@@ -266,6 +351,43 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d) {
         if(m & (1 << 1)) draw_vseg_pinched(c, x + w - t, y, t, half);            // b
         if(m & (1 << 4)) draw_vseg_pinched(c, x, y + h - half, t, half);         // e
         if(m & (1 << 2)) draw_vseg_pinched(c, x + w - t, y + h - half, t, half); // c
+    } else if(style == SegmentStyleLozenge) {
+        // Lozenge style: tapered segment ends with small air gaps between neighbors.
+        const int g = 1;
+        const int x_left = x + g;
+        const int x_right = x + w - t - g;
+        const int y_top = y + g;
+        const int y_mid = ym - (t / 2);
+        const int y_bot = y + h - t - g;
+
+        // Centerlines of segment rails.
+        const int cx_left = x_left + (t / 2);
+        const int cx_right = x_right + (t / 2);
+        const int cy_top = y_top + (t / 2);
+        const int cy_mid = y_mid + (t / 2);
+        const int cy_bot = y_bot + (t / 2);
+
+        // Horizontal bars terminate at vertical segment centerlines.
+        const int h_x = cx_left;
+        int h_w = (cx_right - cx_left + 1);
+        if(h_w < 1) h_w = 1;
+
+        // Vertical bars span centerline-to-centerline.
+        const int upper_y = cy_top;
+        int upper_h = (cy_mid - cy_top + 1);
+        const int lower_y = cy_mid;
+        int lower_h = (cy_bot - cy_mid + 1);
+        if(upper_h < 1) upper_h = 1;
+        if(lower_h < 1) lower_h = 1;
+
+        if(m & (1 << 0)) draw_hseg_lozenge(c, h_x, y_top, h_w, t); // a
+        if(m & (1 << 6)) draw_hseg_lozenge(c, h_x, y_mid, h_w, t); // g
+        if(m & (1 << 3)) draw_hseg_lozenge(c, h_x, y_bot, h_w, t); // d
+
+        if(m & (1 << 5)) draw_vseg_lozenge(c, x_left, upper_y, t, upper_h); // f
+        if(m & (1 << 1)) draw_vseg_lozenge(c, x_right, upper_y, t, upper_h); // b
+        if(m & (1 << 4)) draw_vseg_lozenge(c, x_left, lower_y, t, lower_h); // e
+        if(m & (1 << 2)) draw_vseg_lozenge(c, x_right, lower_y, t, lower_h); // c
     } else {
         // Original look: plain full-thickness rectangles.
         if(m & (1 << 0)) canvas_draw_box(c, x, y, w, t);            // a
@@ -311,6 +433,7 @@ static void draw_colon(Canvas* c, int x, int y, int t) {
 //
 static void draw_cb(Canvas* canvas, void* ctx) {
     App* app = ctx;
+    const SegmentStyle style = app ? (SegmentStyle)app->segment_style : SegmentStyleLozenge;
 
     DateTime dt;
     furi_hal_rtc_get_datetime(&dt);
@@ -362,11 +485,11 @@ static void draw_cb(Canvas* canvas, void* ctx) {
 
     // Defensive guard: if constants ever change and overflow the screen, draw a marker.
     if(xM1 + w <= right_edge) {
-        segdigit(canvas, xH0, y, w, h, t, ht);
-        segdigit(canvas, xH1, y, w, h, t, ho);
+        segdigit(canvas, xH0, y, w, h, t, ht, style);
+        segdigit(canvas, xH1, y, w, h, t, ho, style);
         draw_colon(canvas, cx, y, colon_w);
-        segdigit(canvas, xM0, y, w, h, t, mt);
-        segdigit(canvas, xM1, y, w, h, t, mo);
+        segdigit(canvas, xM0, y, w, h, t, mt, style);
+        segdigit(canvas, xM1, y, w, h, t, mo, style);
     } else {
         canvas_draw_box(canvas, 0, 0, 3, 3);
     }
@@ -443,6 +566,7 @@ int32_t bigclock_app(void* p) {
 
     App app = {0};
     app.mode_24h = load_mode_24h();
+    app.segment_style = load_segment_style();
 
     // Input events sent from ViewPort callback to this thread.
     app.q = furi_message_queue_alloc(8, sizeof(InputEvent));
@@ -479,6 +603,12 @@ int32_t bigclock_app(void* p) {
         if(event.type == InputTypeShort && event.key == InputKeyOk) {
             app.mode_24h = !app.mode_24h;
             save_mode_24h(app.mode_24h);
+            view_port_update(app.vp);
+        }
+        // Cycle segment style on long OK: Classic -> Pinched -> Lozenge.
+        if(event.type == InputTypeLong && event.key == InputKeyOk) {
+            app.segment_style = (uint8_t)((app.segment_style + 1U) % 3U);
+            save_segment_style(app.segment_style);
             view_port_update(app.vp);
         }
     }
