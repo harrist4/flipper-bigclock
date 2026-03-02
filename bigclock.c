@@ -466,15 +466,16 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     const int h = 64;
     const int t = 7;
 
-    const int bar_area_w = 12;
-    const int right_edge = 128 - 2 - bar_area_w;
-
-    const int w = 23;
-    const int gap = 3;
-    const int colon_w = 6;
+    const int w = 24;
+    const int gap = 4;
+    const int colon_w = 4;
     const int colon_gap = 2;
-
-    const int x0 = 2;
+    const int ap_w = 10;
+    const int gap_to_ap = 4;
+    const int ap_x = 128 - ap_w;
+    const int right_edge = ap_x - gap_to_ap;
+    const int bar_area_w = ap_w;
+    const int x0 = right_edge - ((w * 4) + (gap * 2) + colon_w + (colon_gap * 2));
 
     const int xH0 = x0;
     const int xH1 = xH0 + w + gap;
@@ -501,7 +502,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(count > steps) count = steps;
 
     // Make the column shorter to leave room for AM/PM at the bottom.
-    const int bar_w = 11;
+    const int bar_w = 9;
     const int bar_h = 7;
     const int bar_gap = 1;
 
@@ -518,7 +519,6 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     const bool is_pm = (H24 >= 12);
     const bool is_am = !is_pm;
 
-    const int ap_x = right_edge + 1;
     const int ap_y0 = 48;
 
     canvas_set_font(canvas, FontKeyboard);
