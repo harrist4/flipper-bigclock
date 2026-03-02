@@ -337,13 +337,13 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, Segmen
     if(d < 0 || d > 9) return;
 
     uint8_t m = segmap[d];
-    int ym = y + (h / 2);
+    int y_mid = y + ((h - t) / 2);
     int half = h / 2;
 
     if(style == SegmentStylePinched) {
         // Horizontal segments with a narrower center section.
         if(m & (1 << 0)) draw_hseg_pinched(c, x, y, w, t);            // a
-        if(m & (1 << 6)) draw_hseg_pinched(c, x, ym - (t / 2), w, t); // g
+        if(m & (1 << 6)) draw_hseg_pinched(c, x, y_mid, w, t); // g
         if(m & (1 << 3)) draw_hseg_pinched(c, x, y + h - t, w, t);    // d
 
         // Vertical segments with a narrower center section.
@@ -353,18 +353,18 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, Segmen
         if(m & (1 << 2)) draw_vseg_pinched(c, x + w - t, y + h - half, t, half); // c
     } else if(style == SegmentStyleLozenge) {
         // Lozenge style: tapered segment ends with small air gaps between neighbors.
-        const int g = 1;
+        const int g = 0;
         const int x_left = x + g;
         const int x_right = x + w - t - g;
         const int y_top = y + g;
-        const int y_mid = ym - (t / 2);
+        const int y_mid_seg = y_mid;
         const int y_bot = y + h - t - g;
 
         // Centerlines of segment rails.
         const int cx_left = x_left + (t / 2);
         const int cx_right = x_right + (t / 2);
         const int cy_top = y_top + (t / 2);
-        const int cy_mid = y_mid + (t / 2);
+        const int cy_mid = y_mid_seg + (t / 2);
         const int cy_bot = y_bot + (t / 2);
 
         // Horizontal bars terminate at vertical segment centerlines.
@@ -381,7 +381,7 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, Segmen
         if(lower_h < 1) lower_h = 1;
 
         if(m & (1 << 0)) draw_hseg_lozenge(c, h_x, y_top, h_w, t); // a
-        if(m & (1 << 6)) draw_hseg_lozenge(c, h_x, y_mid, h_w, t); // g
+        if(m & (1 << 6)) draw_hseg_lozenge(c, h_x, y_mid_seg, h_w, t); // g
         if(m & (1 << 3)) draw_hseg_lozenge(c, h_x, y_bot, h_w, t); // d
 
         if(m & (1 << 5)) draw_vseg_lozenge(c, x_left, upper_y, t, upper_h); // f
@@ -391,7 +391,7 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, Segmen
     } else {
         // Original look: plain full-thickness rectangles.
         if(m & (1 << 0)) canvas_draw_box(c, x, y, w, t);            // a
-        if(m & (1 << 6)) canvas_draw_box(c, x, ym - (t / 2), w, t); // g
+        if(m & (1 << 6)) canvas_draw_box(c, x, y_mid, w, t); // g
         if(m & (1 << 3)) canvas_draw_box(c, x, y + h - t, w, t);    // d
 
         if(m & (1 << 5)) canvas_draw_box(c, x, y, t, half);                    // f
@@ -468,11 +468,11 @@ static void draw_cb(Canvas* canvas, void* ctx) {
 
     const int w = 24;
     const int gap = 4;
-    const int colon_w = 4;
+    const int colon_w = 6;
     const int colon_gap = 2;
     const int ap_w = 10;
     const int gap_to_ap = 4;
-    const int ap_x = 128 - ap_w;
+    const int ap_x = 127 - ap_w;
     const int right_edge = ap_x - gap_to_ap;
     const int bar_area_w = ap_w;
     const int x0 = right_edge - ((w * 4) + (gap * 2) + colon_w + (colon_gap * 2));
@@ -502,16 +502,23 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(count > steps) count = steps;
 
     // Make the column shorter to leave room for AM/PM at the bottom.
-    const int bar_w = 9;
+    const int bar_w = 11;
     const int bar_h = 7;
     const int bar_gap = 1;
 
-    const int bx = right_edge + ((bar_area_w - bar_w + 1) / 2) ;
+    const int bx = ap_x + ((bar_area_w - bar_w + 1) / 2);
     const int by = 0;
 
     for(int i = 0; i < count; i++) {
         int yy = by + i * (bar_h + bar_gap);
-        canvas_draw_frame(canvas, bx, yy, bar_w, bar_h);
+        for(int dx = 0; dx < bar_w; dx++) {
+            canvas_draw_dot(canvas, bx + dx, yy);
+            canvas_draw_dot(canvas, bx + dx, yy + bar_h - 1);
+        }
+        for(int dy = 0; dy < bar_h; dy++) {
+            canvas_draw_dot(canvas, bx, yy + dy);
+            canvas_draw_dot(canvas, bx + bar_w - 1, yy + dy);
+        }
     }
 
     // AM/PM indicator (LCD-style): two fixed labels, only one is "lit".

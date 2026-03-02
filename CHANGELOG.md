@@ -12,3 +12,11 @@
 - Updated brightness HUD: removed +/- glyphs and expanded meter to full right-side height
 - Improved backlight exit behavior and state restore flow
 - Dimming/brightness control is still in-progress and needs another focused pass later
+
+## 2026-03-02
+- Increased digit width to 24px and set inter-digit spacing to 4px for fuller edge-to-edge layout
+- Restored 6px colon width while keeping 2px side spacing around the colon
+- Kept AM/PM column at 10px and refined horizontal placement to match the right-side visual edge
+- Updated progress bar geometry to 11px width with corrected column alignment
+- Removed top/bottom lozenge inset so digits use full vertical height
+- Corrected middle horizontal segment placement to true vertical centering
