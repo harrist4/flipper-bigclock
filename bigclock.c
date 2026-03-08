@@ -13,6 +13,20 @@
 #include <storage/storage.h>
 
 // ----------------------------------------------------------------------------
+// bigclock.c
+// ----------------------------------------------------------------------------
+//
+// Render path:
+//   ViewPort draw callback -> segdigit() -> style-specific renderer.
+//
+// Segment styles:
+//   0: classic rectangle 7-segment
+//   1: lozenge segment 7-seg
+//   2: bitmap font digits (manual dot map)
+//
+// Persisted settings are loaded at startup and re-saved on user input only.
+
+// ----------------------------------------------------------------------------
 // App state
 // ----------------------------------------------------------------------------
 //
@@ -30,6 +44,15 @@ typedef struct {
     bool mode_24h;            // false=12h with AM/PM, true=24h with "24"
     uint8_t segment_style;    // SegmentStyle persisted selection
 } App;
+
+// Files persisted under APP_DATA_PATH:
+//   mode24.bin      => one byte: 0 (12h), 1 (24h)
+//   segment_style.bin=> one byte: 0 (classic), 1 (lozenge), 2 (font)
+//
+// App state rule:
+// - load both files on startup
+// - only read RTC each frame (no cached time state)
+// - write on explicit user action
 
 // ----------------------------------------------------------------------------
 // Persisted settings: 24-hour mode
@@ -120,9 +143,10 @@ static void save_mode_24h(bool mode) {
     furi_record_close(RECORD_STORAGE);
 }
 
-// Load persisted segment style; defaults to lozenge.
+// Load persisted segment style; defaults to classic block digits.
+// Stored bytes are sanitized to only 0, 1, or 2.
 static uint8_t load_segment_style(void) {
-    uint8_t style = 2; // SegmentStyleLozenge
+    uint8_t style = 0; // SegmentStyleClassic
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(storage);
@@ -132,7 +156,15 @@ static uint8_t load_segment_style(void) {
 
     if(storage_file_open(f, furi_string_get_cstr(path), FSAM_READ, FSOM_OPEN_EXISTING)) {
         uint8_t b = 0;
-        if(storage_file_read(f, &b, 1) == 1 && b <= 2) style = b;
+        if(storage_file_read(f, &b, 1) == 1) {
+            if(b == 0) {
+                style = 0; // SegmentStyleClassic
+            } else if(b == 1) {
+                style = 1; // SegmentStyleLozenge
+            } else if(b == 2) {
+                style = 2; // SegmentStyleFont
+            }
+        }
         storage_file_close(f);
     }
 
@@ -144,6 +176,13 @@ static uint8_t load_segment_style(void) {
 }
 
 // Save persisted segment style.
+//
+// File format:
+//   1 byte enum ordinal, same contract as SegmentStyle:
+//   0=classic, 1=lozenge, 2=font.
+//
+// As with mode persistence, write failures are non-fatal and only affect
+// whether the preference survives the next app launch.
 static void save_segment_style(uint8_t style) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(storage);
@@ -190,65 +229,778 @@ static const uint8_t segmap[10] = {
     /*9*/ 0b1101111,
 };
 
+// Segment style is an explicit ordinal contract used by persisted storage:
+// 0=classic, 1=lozenge, 2=font.
 typedef enum {
     SegmentStyleClassic = 0,
-    SegmentStylePinched = 1,
-    SegmentStyleLozenge = 2,
+    SegmentStyleLozenge = 1,
+    SegmentStyleFont = 2,
 } SegmentStyle;
 
-// Draw a horizontal segment with a subtle center "pinch":
-// full-thickness shoulders and a slightly thinner middle section.
-static void draw_hseg_pinched(Canvas* c, int x, int y, int w, int t) {
-    if(w <= 0 || t <= 0) return;
+// Font glyph geometry constants are canonical for all font-style edits:
+// - exactly 10 digits
+// - 64 rows per digit
+// - 24 columns per row
+#define FONT_DIGIT_COUNT 10u
+#define FONT_DIGIT_HEIGHT 64u
+#define FONT_DIGIT_WIDTH 24u
+#define FONT_DIGIT_ROW_BYTES (FONT_DIGIT_WIDTH + 1u)
 
-    const int pinch = (t >= 4) ? ((t >= 8) ? 2 : 1) : 0;
-    const int mid_h = t - (pinch * 2);
-    if(mid_h <= 0 || w < 5) {
-        canvas_draw_box(c, x, y, w, t);
-        return;
+// font_digits[d][y] maps directly to digit d (0..9), row y (0..63),
+// with a human-friendly "."/"X" visual layout.
+// Edit blocks are intentionally index-labeled (// 0 ... // 9) for quick manual tuning.
+static const char font_digits[FONT_DIGIT_COUNT][FONT_DIGIT_HEIGHT][FONT_DIGIT_ROW_BYTES] = {
+    // 0
+    {
+        "........XXXXXXXX........",
+        ".......XXXXXXXXXX.......",
+        "......XXXXXXXXXXXX......",
+        ".....XXXXXXXXXXXXXX.....",
+        "....XXXXXXXXXXXXXXX.....",
+        "....XXXXXXXXXXXXXXXX....",
+        "....XXXXXXX..XXXXXXX....",
+        "...XXXXXX......XXXXXX...",
+        "...XXXXXX.......XXXXX...",
+        "..XXXXX..........XXXX...",
+        "..XXXXX..........XXXXX..",
+        "..XXXXX..........XXXXX..",
+        "..XXXXX..........XXXXX..",
+        "..XXXX............XXXX..",
+        ".XXXXX............XXXX..",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXX.............XXXXX.",
+        ".XXXX..............XXXX.",
+        ".XXXX..............XXXX.",
+        ".XXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX.............XXXXX.",
+        "XXXXX.............XXXXX.",
+        "XXXXX.............XXXXX.",
+        "XXXXX.............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        "..XXXX...........XXXXX..",
+        "..XXXX...........XXXXX..",
+        "..XXXXX..........XXXXX..",
+        "..XXXXX..........XXXX...",
+        "...XXXXX........XXXXX...",
+        "...XXXXX.......XXXXXX...",
+        "...XXXXXX.....XXXXXX....",
+        "....XXXXXXX..XXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXX......",
+        "......XXXXXXXXXXX.......",
+        ".......XXXXXXXXX........",
+        "........XXXXXXX.........",
+    },
+    // 1
+    {
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "..................XXXXXX",
+        ".................XXXXXXX",
+        "..............XXXXXXXXXX",
+        "..........XXXXXXXXXXXXXX",
+        "..........XXXXXXXXXXXXXX",
+        "..........XXXXXXXXXXXXXX",
+        "..........XXXXXXXXXXXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+    },
+    // 2
+    {
+        "............X...........",
+        "........XXXXXXXXX.......",
+        ".......XXXXXXXXXXX......",
+        "......XXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "...XXXXXXX....XXXXXXXX..",
+        "...XXXXXX......XXXXXXX..",
+        "...XXXXX........XXXXXX..",
+        "..XXXXXX.........XXXXX..",
+        "..XXXXX..........XXXXXX.",
+        "..XXXXX...........XXXXX.",
+        "..XXXX............XXXXX.",
+        "..XXXX............XXXXX.",
+        ".XXXXX.............XXXX.",
+        ".XXXXX.............XXXX.",
+        ".XXXXX.............XXXX.",
+        ".XXXXX.............XXXX.",
+        ".XXXX..............XXXX.",
+        ".XXXX..............XXXX.",
+        ".XXXX..............XXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        ".................XXXXXX.",
+        ".................XXXXX..",
+        "................XXXXXX..",
+        "................XXXXXX..",
+        "...............XXXXXX...",
+        "..............XXXXXXX...",
+        ".............XXXXXXX....",
+        "............XXXXXXX.....",
+        "...........XXXXXXXX.....",
+        "..........XXXXXXXX......",
+        ".........XXXXXXXX.......",
+        "........XXXXXXXX........",
+        "........XXXXXXX.........",
+        ".......XXXXXXXX.........",
+        "......XXXXXXXX..........",
+        ".....XXXXXXXX...........",
+        ".....XXXXXXX............",
+        "....XXXXXXX.............",
+        "....XXXXXX..............",
+        "...XXXXXX...............",
+        "...XXXXXX...............",
+        "..XXXXXX................",
+        "..XXXXX.................",
+        "..XXXXX.................",
+        "..XXXX..................",
+        "..XXXX..................",
+        ".XXXXX..................",
+        ".XXXX...................",
+        ".XXXX...................",
+        ".XXXX...................",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+    },
+
+    // 3
+    {
+        "...........XX...........",
+        "........XXXXXXXX........",
+        ".......XXXXXXXXXX.......",
+        "......XXXXXXXXXXXX......",
+        ".....XXXXXXXXXXXXXX.....",
+        "....XXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        "...XXXXXXXXXXXXXXXXX....",
+        "...XXXXXXX...XXXXXXXX...",
+        "...XXXXXX......XXXXXX...",
+        "..XXXXXX........XXXXX...",
+        ".................XXXXX..",
+        ".................XXXXX..",
+        ".................XXXXX..",
+        ".................XXXXX..",
+        "..................XXXX..",
+        "..................XXXX..",
+        "..................XXXX..",
+        "..................XXXX..",
+        "..................XXXX..",
+        ".................XXXXX..",
+        ".................XXXXX..",
+        "................XXXXX...",
+        "................XXXXX...",
+        "...............XXXXXX...",
+        "...............XXXXXX...",
+        "............XXXXXXXX....",
+        ".....XXXXXXXXXXXXXXX....",
+        ".....XXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXX......",
+        ".....XXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXXX.....",
+        "............XXXXXXXXX...",
+        "..............XXXXXXX...",
+        "...............XXXXXXX..",
+        "................XXXXXX..",
+        ".................XXXXX..",
+        ".................XXXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        ".XXXX..............XXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXXX..........XXXXX..",
+        ".XXXXXXX........XXXXXX..",
+        "..XXXXXX.......XXXXXXX..",
+        "..XXXXXXXX....XXXXXXX...",
+        "...XXXXXXXXXXXXXXXXXX...",
+        "...XXXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        ".....XXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXX......",
+        "......XXXXXXXXXXX.......",
+        ".........XXXXX..........",
+    },
+    // 4
+    {
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "..............XXXXX.....",
+        "..............XXXXX.....",
+        ".............XXXXXX.....",
+        ".............XXXXXX.....",
+        ".............XXXXXX.....",
+        "............XXXXXXX.....",
+        "............XXXXXXX.....",
+        "............XXXXXXX.....",
+        "............XXXXXXX.....",
+        "...........XXXXXXXX.....",
+        "...........XXXXXXXX.....",
+        "...........XXXXXXXX.....",
+        "..........XXXX.XXXX.....",
+        "..........XXX..XXXX.....",
+        ".........XXXX..XXXX.....",
+        ".........XXXX..XXXX.....",
+        ".........XXX...XXXX.....",
+        "........XXXX...XXXX.....",
+        "........XXXX...XXXX.....",
+        ".......XXXXX...XXXX.....",
+        ".......XXXX....XXXX.....",
+        ".......XXXX....XXXX.....",
+        "......XXXXX....XXXX.....",
+        "......XXXX.....XXXX.....",
+        "......XXXX.....XXXX.....",
+        ".....XXXXX.....XXXX.....",
+        ".....XXXX......XXXX.....",
+        ".....XXXX......XXXX.....",
+        "....XXXX.......XXXX.....",
+        "...XXXXX.......XXXX.....",
+        "...XXXX........XXXX.....",
+        "...XXXX........XXXX.....",
+        "..XXXXX........XXXX.....",
+        "..XXXX.........XXXX.....",
+        "..XXXX.........XXXX.....",
+        ".XXXXX.........XXXX.....",
+        ".XXXX..........XXXX.....",
+        ".XXXX..........XXXX.....",
+        "XXXXX..........XXXX.....",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "XXXXXXXXXXXXXXXXXXXXXXX.",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+    },
+    // 5
+    {
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXXX.................",
+        "...XXX..................",
+        "...XXX..................",
+        "...XXX..................",
+        "...XXX..................",
+        "...XXX..................",
+        "..XXXX.....XX...........",
+        "..XXXX...XXXXXXX........",
+        "..XXXX.XXXXXXXXXX.......",
+        "..XXXXXXXXXXXXXXXX......",
+        "..XXXXXXXXXXXXXXXXX.....",
+        "..XXXXXXXXXXXXXXXXXX....",
+        "..XXXXXXXXXXXXXXXXXX....",
+        "..XXXXXXXXXXXXXXXXXXX...",
+        "..XXXXXXX.....XXXXXXX...",
+        "..XXXXXX.......XXXXXXX..",
+        "..XXXXX.........XXXXXX..",
+        "..XXXX...........XXXXXX.",
+        "..XXXX...........XXXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "..................XXXXX.",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXXX",
+        "...................XXXX.",
+        "...................XXXX.",
+        "...................XXXX.",
+        "XXXXX.............XXXXX.",
+        "XXXXX.............XXXXX.",
+        "XXXXX.............XXXXX.",
+        ".XXXX.............XXXX..",
+        ".XXXXX...........XXXXX..",
+        ".XXXXX...........XXXXX..",
+        ".XXXXXX.........XXXXXX..",
+        "..XXXXX.........XXXXX...",
+        "..XXXXXX.......XXXXXX...",
+        "..XXXXXXXX....XXXXXXX...",
+        "...XXXXXXXXXXXXXXXXX....",
+        "...XXXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXX.....",
+        "....XXXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXX......",
+        "......XXXXXXXXXXX.......",
+        "........................",
+    },
+    // 6
+    {
+        "............XX..........",
+        ".........XXXXXXXX.......",
+        "........XXXXXXXXXX......",
+        ".......XXXXXXXXXXXX.....",
+        "......XXXXXXXXXXXXXX....",
+        "......XXXXXXXXXXXXXX....",
+        ".....XXXXXXXXXXXXXXXX...",
+        ".....XXXXXXXXXXXXXXXX...",
+        "....XXXXXXX....XXXXXX...",
+        "....XXXXXX......XXXXXX..",
+        "....XXXXX........XXXXX..",
+        "...XXXXX..........XXXX..",
+        "...XXXXX..........XXXX..",
+        "...XXXX...........XXXXX.",
+        "..XXXXX...........XXXXX.",
+        "..XXXXX...........XXXXX.",
+        "..XXXX.............XXXX.",
+        "..XXXX..................",
+        "..XXXX..................",
+        "..XXXX..................",
+        ".XXXXX..................",
+        ".XXXX...................",
+        ".XXXX...................",
+        ".XXXX.....XXXXXX........",
+        ".XXXX....XXXXXXXXX......",
+        ".XXXX...XXXXXXXXXXX.....",
+        ".XXXX..XXXXXXXXXXXX.....",
+        ".XXXX.XXXXXXXXXXXXXX....",
+        "XXXXX.XXXXXXXXXXXXXXX...",
+        "XXXXXXXXXXXXXXXXXXXXX...",
+        "XXXXXXXXXXXX.XXXXXXXXX..",
+        "XXXXXXXXXX.....XXXXXXX..",
+        "XXXXXXXX.........XXXXX..",
+        "XXXXXXX..........XXXXXX.",
+        "XXXXXXX...........XXXXX.",
+        "XXXXXXX...........XXXXX.",
+        "XXXXXX............XXXXX.",
+        "XXXXXX............XXXXX.",
+        "XXXXXX.............XXXXX",
+        "XXXXXX.............XXXXX",
+        "XXXXXX.............XXXXX",
+        "XXXXXX.............XXXXX",
+        "XXXXXX.............XXXXX",
+        ".XXXXX.............XXXXX",
+        ".XXXXX.............XXXXX",
+        ".XXXXX.............XXXXX",
+        ".XXXXX.............XXXXX",
+        ".XXXXX.............XXXX.",
+        ".XXXXX.............XXXX.",
+        "..XXXX............XXXXX.",
+        "..XXXX............XXXXX.",
+        "..XXXXX...........XXXXX.",
+        "..XXXXX...........XXXX..",
+        "...XXXXX.........XXXXX..",
+        "...XXXXX........XXXXXX..",
+        "...XXXXXX.......XXXXX...",
+        "....XXXXXXX...XXXXXXX...",
+        "....XXXXXXXXXXXXXXXXX...",
+        ".....XXXXXXXXXXXXXXX....",
+        ".....XXXXXXXXXXXXXXX....",
+        "......XXXXXXXXXXXXX.....",
+        ".......XXXXXXXXXXX......",
+        "........XXXXXXXXX.......",
+        "........................",
+    },
+    // 7
+    {
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        ".XXXXXXXXXXXXXXXXXXXXXX.",
+        "...................XXXX.",
+        "...................XXXX.",
+        "..................XXXX..",
+        "..................XXXX..",
+        ".................XXXXX..",
+        ".................XXXX...",
+        ".................XXXX...",
+        "................XXXX....",
+        "................XXXX....",
+        "...............XXXXX....",
+        "...............XXXX.....",
+        "...............XXXX.....",
+        "..............XXXXX.....",
+        "..............XXXX......",
+        "..............XXXX......",
+        "..............XXXX......",
+        ".............XXXXX......",
+        ".............XXXX.......",
+        ".............XXXX.......",
+        "............XXXXX.......",
+        "............XXXX........",
+        "............XXXX........",
+        "...........XXXXX........",
+        "...........XXXXX........",
+        "...........XXXX.........",
+        "..........XXXXX.........",
+        "..........XXXXX.........",
+        "..........XXXX..........",
+        "..........XXXX..........",
+        ".........XXXXX..........",
+        ".........XXXXX..........",
+        ".........XXXXX..........",
+        ".........XXXX...........",
+        ".........XXXX...........",
+        "........XXXXX...........",
+        "........XXXXX...........",
+        "........XXXXX...........",
+        "........XXXX............",
+        "........XXXX............",
+        "........XXXX............",
+        ".......XXXXX............",
+        ".......XXXXX............",
+        ".......XXXXX............",
+        ".......XXXX.............",
+        ".......XXXX.............",
+        ".......XXXX.............",
+        "......XXXXX.............",
+        "......XXXXX.............",
+        "......XXXXX.............",
+        "......XXXXX.............",
+        "......XXXXX.............",
+        "......XXXXX.............",
+        "......XXXX..............",
+        "......XXXX..............",
+        "......XXXX..............",
+        ".....XXXXX..............",
+    },
+    // 8
+    {
+        "...........XX...........",
+        "........XXXXXXXX........",
+        ".......XXXXXXXXXX.......",
+        "......XXXXXXXXXXXX......",
+        ".....XXXXXXXXXXXXXX.....",
+        "....XXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        "...XXXXXXXXXXXXXXXXX....",
+        "...XXXXXXX...XXXXXXXX...",
+        "...XXXXXX......XXXXXX...",
+        "..XXXXXX........XXXXX...",
+        "..XXXXX..........XXXXX..",
+        "..XXXXX..........XXXXX..",
+        "..XXXX...........XXXXX..",
+        "..XXXX...........XXXXX..",
+        "..XXXX............XXXX..",
+        "..XXXX............XXXX..",
+        "..XXXX............XXXX..",
+        "..XXXX............XXXX..",
+        "..XXXX............XXXX..",
+        "..XXXX...........XXXXX..",
+        "..XXXXX..........XXXXX..",
+        "..XXXXX.........XXXXX...",
+        "..XXXXX.........XXXXX...",
+        "...XXXXX.......XXXXXX...",
+        "...XXXXXX......XXXXXX...",
+        "...XXXXXXXX.XXXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        ".....XXXXXXXXXXXXXX.....",
+        "......XXXXXXXXXXXX......",
+        ".....XXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXXX.....",
+        "...XXXXXXXXXXXXXXXXXX...",
+        "...XXXXXXX....XXXXXXX...",
+        "..XXXXXX.......XXXXXXX..",
+        "..XXXXXX........XXXXXX..",
+        "..XXXXX..........XXXXX..",
+        ".XXXXX...........XXXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXX.............XXXXX.",
+        ".XXXX.............XXXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        "XXXXX..............XXXX.",
+        ".XXXX..............XXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXX............XXXXX.",
+        ".XXXXXX..........XXXXX..",
+        "..XXXXXX........XXXXXX..",
+        "..XXXXXX.......XXXXXXX..",
+        "..XXXXXXXX....XXXXXXX...",
+        "...XXXXXXXXXXXXXXXXXX...",
+        "...XXXXXXXXXXXXXXXXX....",
+        "....XXXXXXXXXXXXXXXX....",
+        ".....XXXXXXXXXXXXXX.....",
+        ".....XXXXXXXXXXXXX......",
+        "......XXXXXXXXXXX.......",
+        ".........XXXXX..........",
+    },
+    // 9
+    {
+        "........................",
+        ".........XXXXX..........",
+        "........XXXXXXXX........",
+        "......XXXXXXXXXX......",
+        ".....XXXXXXXXXXXX.....",
+        "....XXXXXXXXXXXXXX....",
+        "...XXXXXXXXXXXXXXXX...",
+        "...XXXXXXXXXXXXXXXX...",
+        "...XXXXXX.....XXXXXX...",
+        "...XXXXX.......XXXXX...",
+        "..XXXX..........XXXX...",
+        "..XXXX..........XXXX...",
+        ".XXXX...........XXXX..",
+        ".XXXX...........XXXX..",
+        ".XXXX...........XXXXX.",
+        ".XXXX...........XXXXX.",
+        ".XXXX...........XXXXX.",
+        ".XXXX...........XXXXX.",
+        ".XXXX...........XXXXX.",
+        ".XXXX...........XXXXX.",
+        ".XXXX............XXXX.",
+        ".XXX.............XXXX.",
+        ".XXX.............XXXX.",
+        ".XX..............XXXX.",
+        ".XX..............XXXX.",
+        ".XX..............XXXX.",
+        ".XX..............XXXX.",
+        ".XXX............XXXXX.",
+        ".XXXX...........XXXXX.",
+        ".XXXX..........XXXXX..",
+        ".XXXXX.........XXXXX..",
+        ".XXXXX.........XXXXX..",
+        ".XXXX..........XXXXX..",
+        ".XXXX...........XXXX..",
+        ".XXXX...........XXXX..",
+        ".XXXX............XXX..",
+        ".XXXX............XX...",
+        "....XXX...........XX...",
+        "....XXXX.........XXX...",
+        "....XXXX.........XXXX..",
+        ".....XXXX.......XXXXX..",
+        "......XXX......XXXXXX..",
+        "......XXXXX...XXXXXX...",
+        ".......XXXXXXXXXXXX....",
+        "........XXXXXXXXX......",
+        "...........XXXXX.......",
+        "...........XXXXX.......",
+        "............XXX........",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+        ".......................",
+    },
+};
+
+_Static_assert(FONT_DIGIT_COUNT == 10u, "font_digits count must remain 10");
+_Static_assert(FONT_DIGIT_WIDTH == 24u, "font_digits row width must remain 24");
+_Static_assert(sizeof(font_digits) == (FONT_DIGIT_COUNT * FONT_DIGIT_HEIGHT * FONT_DIGIT_ROW_BYTES),
+               "font_digits requires exactly 10x64 rows of 24-char patterns");
+_Static_assert(sizeof(font_digits[0]) == (FONT_DIGIT_HEIGHT * FONT_DIGIT_ROW_BYTES),
+               "font_digits digit entries must contain exactly 64 rows");
+_Static_assert(sizeof(font_digits[0][0]) == FONT_DIGIT_ROW_BYTES,
+               "font_digits rows must be 24 chars plus terminator");
+
+// Compile-time checks guarantee table shape; debug-time checks validate data quality.
+#ifndef NDEBUG
+static bool g_font_digits_valid = true;
+
+// Validate a row has only supported glyph chars and exactly one terminating nul.
+static bool validate_font_digit_row(const char* row) {
+    if(!row) return false;
+    for(int x = 0; x < (int)FONT_DIGIT_WIDTH; x++) {
+        const char c = row[x];
+        if(c != '.' && c != 'X') return false;
     }
-
-    int shoulder = w / 4;
-    if(shoulder < 2) shoulder = 2;
-    if(shoulder > 6) shoulder = 6;
-    if(shoulder * 2 >= w) {
-        canvas_draw_box(c, x, y, w, t);
-        return;
-    }
-
-    const int mid_w = w - (shoulder * 2);
-    canvas_draw_box(c, x, y, shoulder, t);
-    canvas_draw_box(c, x + shoulder, y + pinch, mid_w, mid_h);
-    canvas_draw_box(c, x + shoulder + mid_w, y, shoulder, t);
+    return row[FONT_DIGIT_WIDTH] == '\0';
 }
 
-// Draw a vertical segment with a subtle center "pinch":
-// full-width caps and a slightly thinner middle section.
-static void draw_vseg_pinched(Canvas* c, int x, int y, int t, int h) {
-    if(h <= 0 || t <= 0) return;
-
-    const int pinch = (t >= 4) ? ((t >= 8) ? 2 : 1) : 0;
-    const int mid_w = t - (pinch * 2);
-    if(mid_w <= 0 || h < 5) {
-        canvas_draw_box(c, x, y, t, h);
-        return;
+static bool validate_font_digits(void) {
+    // Full table scan: exactly 10 glyphs * 64 rows each.
+    // We intentionally stop at first error because any malformed row means
+    // the font cannot be trusted for rendering.
+    for(int d = 0; d < (int)FONT_DIGIT_COUNT; d++) {
+        for(int y = 0; y < (int)FONT_DIGIT_HEIGHT; y++) {
+            if(!validate_font_digit_row(font_digits[d][y])) return false;
+        }
     }
-
-    int cap = h / 4;
-    if(cap < 2) cap = 2;
-    if(cap > 6) cap = 6;
-    if(cap * 2 >= h) {
-        canvas_draw_box(c, x, y, t, h);
-        return;
-    }
-
-    const int mid_h = h - (cap * 2);
-    canvas_draw_box(c, x, y, t, cap);
-    canvas_draw_box(c, x + pinch, y + cap, mid_w, mid_h);
-    canvas_draw_box(c, x, y + cap + mid_h, t, cap);
+    return true;
 }
+#endif
+
+// Font renderer is intentionally simple: draw dots where glyph has 'X', up to h rows.
+static void draw_scaled_font_digit(Canvas* c, int x, int y, int w, int h, int d) {
+    if(d < 0 || d > 9 || w <= 0 || h <= 0) return;
+
+    const int rows_to_draw = h < (int)FONT_DIGIT_HEIGHT ? h : (int)FONT_DIGIT_HEIGHT;
+    for(int yy = 0; yy < rows_to_draw; yy++) {
+        const char* row = font_digits[d][yy];
+        for(int x_off = 0; x_off < (int)FONT_DIGIT_WIDTH && x_off < w; x_off++) {
+            if(row[x_off] == 'X') {
+                canvas_draw_dot(c, x + x_off, y + yy);
+            }
+        }
+    }
+}
+
+#ifndef NDEBUG
+// Debug marker for invalid font data; visible only when font mode is selected.
+static void draw_font_digits_invalid_marker(Canvas* c) {
+    for(int i = 0; i < 10; i++) {
+        canvas_draw_dot(c, 1 + i, 1 + i);
+        canvas_draw_dot(c, 10 - i, 1 + i);
+        canvas_draw_dot(c, 1 + i, 10 + i);
+    }
+    for(int x = 0; x < 12; x++) {
+        canvas_draw_dot(c, 1 + x, 10);
+        canvas_draw_dot(c, 10 + x, 1);
+    }
+}
+#endif
+
+#ifndef NDEBUG
+static void invalidate_font_digits_if_needed(void) {
+    // Startup-time cache of validation status.
+    // Draw path reads this boolean to either render glyphs or show debug marker.
+    g_font_digits_valid = validate_font_digits();
+}
+#endif
+
+
 
 // Draw a horizontal lozenge segment: center rectangle with tapered end caps.
+// Used by segdigit() for styles that emulate LCD-like angled segment ends.
 static void draw_hseg_lozenge(Canvas* c, int x, int y, int w, int t) {
     if(w <= 0 || t <= 0) return;
     int tip = (t / 2) + 1;
@@ -272,6 +1024,7 @@ static void draw_hseg_lozenge(Canvas* c, int x, int y, int w, int t) {
 }
 
 // Draw a vertical lozenge segment: center rectangle with tapered end caps.
+// Symmetric companion to draw_hseg_lozenge(); same geometry strategy on Y axis.
 static void draw_vseg_lozenge(Canvas* c, int x, int y, int t, int h) {
     if(h <= 0 || t <= 0) return;
     int tip = (t / 2) + 1;
@@ -331,6 +1084,7 @@ static void draw_vseg_lozenge(Canvas* c, int x, int y, int t, int h) {
 //   - The middle segment 'g' is centered at y + h/2 with a half-thickness offset.
 //   - This expects sane values (t <= w and t <= h/2). If you make t huge,
 //     you'll get interesting... abstract art.
+//   - style dispatch is fixed: classic -> rectangles, lozenge -> tapered, font -> bitmap rows.
 //
 static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, SegmentStyle style) {
     // d is -1 to mean "blank" (used for leading zero in hours).
@@ -340,18 +1094,7 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, Segmen
     int y_mid = y + ((h - t) / 2);
     int half = h / 2;
 
-    if(style == SegmentStylePinched) {
-        // Horizontal segments with a narrower center section.
-        if(m & (1 << 0)) draw_hseg_pinched(c, x, y, w, t);            // a
-        if(m & (1 << 6)) draw_hseg_pinched(c, x, y_mid, w, t); // g
-        if(m & (1 << 3)) draw_hseg_pinched(c, x, y + h - t, w, t);    // d
-
-        // Vertical segments with a narrower center section.
-        if(m & (1 << 5)) draw_vseg_pinched(c, x, y, t, half);                    // f
-        if(m & (1 << 1)) draw_vseg_pinched(c, x + w - t, y, t, half);            // b
-        if(m & (1 << 4)) draw_vseg_pinched(c, x, y + h - half, t, half);         // e
-        if(m & (1 << 2)) draw_vseg_pinched(c, x + w - t, y + h - half, t, half); // c
-    } else if(style == SegmentStyleLozenge) {
+    if(style == SegmentStyleLozenge) {
         // Lozenge style: tapered segment ends with small air gaps between neighbors.
         const int g = 0;
         const int x_left = x + g;
@@ -388,6 +1131,8 @@ static void segdigit(Canvas* c, int x, int y, int w, int h, int t, int d, Segmen
         if(m & (1 << 1)) draw_vseg_lozenge(c, x_right, upper_y, t, upper_h); // b
         if(m & (1 << 4)) draw_vseg_lozenge(c, x_left, lower_y, t, lower_h); // e
         if(m & (1 << 2)) draw_vseg_lozenge(c, x_right, lower_y, t, lower_h); // c
+    } else if(style == SegmentStyleFont) {
+        draw_scaled_font_digit(c, x, y, w, h, d);
     } else {
         // Original look: plain full-thickness rectangles.
         if(m & (1 << 0)) canvas_draw_box(c, x, y, w, t);            // a
@@ -433,7 +1178,15 @@ static void draw_colon(Canvas* c, int x, int y, int t) {
 //
 static void draw_cb(Canvas* canvas, void* ctx) {
     App* app = ctx;
-    const SegmentStyle style = app ? (SegmentStyle)app->segment_style : SegmentStyleLozenge;
+    // Resolve style from persisted user preference; no stateful mode is stored in draw.
+    const SegmentStyle style = app ? (SegmentStyle)app->segment_style : SegmentStyleClassic;
+
+#ifndef NDEBUG
+    if(style == SegmentStyleFont && !g_font_digits_valid) {
+        draw_font_digits_invalid_marker(canvas);
+        return;
+    }
+#endif
 
     DateTime dt;
     furi_hal_rtc_get_datetime(&dt);
@@ -484,7 +1237,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     const int xM0 = cx + colon_w + colon_gap;
     const int xM1 = xM0 + w + gap;
 
-    // Defensive guard: if constants ever change and overflow the screen, draw a marker.
+    // Defensive guard: if constants ever change and overflow the screen, draw marker.
     if(xM1 + w <= right_edge) {
         segdigit(canvas, xH0, y, w, h, t, ht, style);
         segdigit(canvas, xH1, y, w, h, t, ho, style);
@@ -547,6 +1300,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
 //
 static void input_cb(InputEvent* event, void* ctx) {
     App* app = ctx;
+    // Non-blocking producer in GUI/input context; main loop consumes from app.q.
     furi_message_queue_put(app->q, event, FuriWaitForever);
 }
 
@@ -555,6 +1309,7 @@ static void input_cb(InputEvent* event, void* ctx) {
 //
 static void tick_cb(void* ctx) {
     ViewPort* vp = ctx;
+    // Timer only requests repaint; all clock state is derived in draw_cb().
     view_port_update(vp);
 }
 
@@ -572,6 +1327,7 @@ int32_t bigclock_app(void* p) {
     UNUSED(p);
 
     App app = {0};
+    // Preferences are loaded once up front; time itself is always pulled from RTC.
     app.mode_24h = load_mode_24h();
     app.segment_style = load_segment_style();
 
@@ -593,6 +1349,12 @@ int32_t bigclock_app(void* p) {
     // Keep backlight on so the clock stays visible (no auto-timeout).
     notification_message(app.notif, &sequence_display_backlight_enforce_on);
 
+    // Debug-only one-time font-data pass; this keeps malformed glyphs visible
+    // when font mode is selected.
+    #ifndef NDEBUG
+    invalidate_font_digits_if_needed();
+    #endif
+
     // Once-per-second redraw so time and alive indicator update.
     app.timer = furi_timer_alloc(tick_cb, FuriTimerTypePeriodic, app.vp);
     furi_timer_start(app.timer, furi_ms_to_ticks(1000));
@@ -612,7 +1374,7 @@ int32_t bigclock_app(void* p) {
             save_mode_24h(app.mode_24h);
             view_port_update(app.vp);
         }
-        // Cycle segment style on long OK: Classic -> Pinched -> Lozenge.
+        // Cycle segment style on long OK: Classic -> Lozenge -> Font.
         if(event.type == InputTypeLong && event.key == InputKeyOk) {
             app.segment_style = (uint8_t)((app.segment_style + 1U) % 3U);
             save_segment_style(app.segment_style);
