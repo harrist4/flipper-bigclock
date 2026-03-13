@@ -31,3 +31,6 @@
 - Confirmed deploy flow via `ufbt launch` with updated digit set
 - Updated project docs (`README.md`) to reflect current controls, style modes, and font workflow
 - Expanded in-file comments/documentation in `bigclock.c` without changing behavior
+
+## 2026-03-13
+- Added Helvetica and Univers stylesfor the digits. Currently Helvetica is selected and the displayed font is hard coded.
